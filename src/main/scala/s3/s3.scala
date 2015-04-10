@@ -648,4 +648,77 @@ object FutureTransfer {
 
     p.future
   }
+
+  def listenForStateChange[T <: Transfer](transfer: T): Future[transfer.type] = {
+    import com.amazonaws.services.s3.transfer.internal.{ AbstractTransfer, TransferStateChangeListener }
+    val transferDescription = transfer.getDescription
+    def debugLog(eventType: String): Unit = {
+      logger.debug(s"$eventType : $transferDescription")
+    }
+    def logTransferState(state: Transfer.TransferState): Unit = {
+      if (logger.isDebugEnabled) {
+        state match {
+          case Transfer.TransferState.Waiting =>
+            debugLog("Waiting")
+          case Transfer.TransferState.InProgress =>
+            debugLog("InProgress")
+          case Transfer.TransferState.Completed =>
+            debugLog("Completed")
+          case Transfer.TransferState.Canceled =>
+            debugLog("Canceled")
+          case Transfer.TransferState.Failed =>
+            debugLog("Failed")
+          case _ =>
+            logger.warn(s"unrecognized transfer state for transfer $transferDescription")
+        }
+      }
+    }
+
+    val p = Promise[transfer.type]
+
+    /* Attach a state change listener to the transfer.
+     * At this point, the transfer is already in progress
+     * and may even have already completed. We will have
+     * missed any state change events that have already been
+     * fired, including the completion event!
+     */
+    transfer.asInstanceOf[AbstractTransfer].addStateChangeListener(new TransferStateChangeListener {
+      /* Note that the transferStateChanged will be called in the Java SDK’s
+       * special thread for callbacks, so any blocking calls here have
+       * the potential to induce deadlock.
+       */
+      override def transferStateChanged(t: Transfer, state: Transfer.TransferState): Unit = {
+        logTransferState(state)
+
+        if (state == Transfer.TransferState.Completed ||
+            state == Transfer.TransferState.Canceled ||
+            state == Transfer.TransferState.Failed) {
+          val success = p trySuccess transfer
+          if (logger.isDebugEnabled) {
+            if (success) {
+              logger.debug(s"promise successfully completed from transfer state change listener for $transferDescription")
+            } else {
+              logger.debug(s"promise was found to be already completed from transfer state change listener for $transferDescription")
+            }
+          }
+        }
+      }
+    })
+
+    /* In case the state change listener never fires due to the
+     * transfer already being done, poll the transfer once.
+     */
+    if (transfer.isDone) {
+      val success = p trySuccess transfer
+      if (logger.isDebugEnabled) {
+        if (success) {
+          logger.debug(s"promise successfully completed outside of transfer state change listener for $transferDescription")
+        } else {
+          logger.debug(s"promise was found to be already completed outside of transfer state change listener for $transferDescription")
+        }
+      }
+    }
+
+    p.future
+  }
 }
